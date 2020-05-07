@@ -1,0 +1,160 @@
+#!/usr/bin/env ash
+# shellcheck shell=ash
+#
+# angry_wifi_with_params.sh
+#
+# auto-disconnects clients with a low signal strength on LEDE / OpenWRT. 
+# Great for clients who hold onto a lower-signal-strength accesspoint instead of
+# roaming. Before running, make sure to download the latest MAC addresses with:
+#
+#   wget --no-check-certificate -O - 'https://services13.ieee.org/RST/standards-ra-web/rest/assignments/download/?registry=MAC&text=apple' | cut -d, -f2 > apple_mac_addresses
+#
+# Some notes:
+# - currently, only Apple clients are known to be succesfully  disconnectable... 
+#   ... it would be interesting to know about others, please drop me a note if you have success with others
+# - clients won't be disconnected again for 2 minutes if they end up re-connecting (configurable)
+# - be careful with this script, if you don't have solid wifi everywhere, since clients will constantly be disconnected
+
+SCRIPTNAME="${0##*/}" && SCRIPTNAME="${SCRIPTNAME%.sh}" 
+WORKDIR="/tmp/$SCRIPTNAME.$$" && { mkdir -p "$WORKDIR" && chmod go-rwx "$WORKDIR" ; } || exit 1
+DISCONNECTDIR="$WORKDIR/disco" && mkdir -p "$DISCONNECTDIR"
+MINSIGNAL="-70" # default for now
+REDISCONNECTTIME=120 # seconds
+MACPREFIXFILE="$PWD/mac_addresses" # expected to be found in the current directory
+REASONS="5 0 1 2 3 4 6 7 8 19" # WIFI disconnect hints to be tried out (sent to the client), 19 is pseudo/last
+REASONS="5 0 1 2 3 4 19"
+VERBOSE="" # verbosity flag
+DEBUG=""   # debugging flag
+COUNT=-1    # number of runs, -1 for infinity
+[ -r "$MACPREFIXFILE" ] || echo "$SCRIPTNAME: Warning: No file $MACPREFIXFILE readable, no address filtering tried..." 1>&2
+
+cd $WORKDIR || exit 1
+
+logline() {
+	# date
+  logger -s -t angry_wifi "$1"
+  echohelper -q "$1"
+	}
+
+echohelper() {
+  unset IFS
+  output="$( echo "$*" | sed -e 's/^-.//' | xargs -n 999 )"
+  # IFS=$'\n'
+  [ "$1" = "-d" -a -n "$DEBUG"   ] && echo "$SCRIPTNAME: $output" 1>&2 && return
+  [ "$1" = "-v" -a -n "$VERBOSE" ] && echo "$SCRIPTNAME: $output" 1>&2 && return
+  [ "$1" = "-q" -a -n "$QUIET"   ] || echo "$SCRIPTNAME: $output" 1>&2 && return
+	}
+
+while getopts "?hc:s:i:vdqx" opt    # parso options
+do
+    case "$opt" in
+    \?|h) echo "Usage: $SCRIPTNAME [-c maxcount] [-s minsignal] [-i wifi_interface] [-v] [-d] [-q] [-x]" 1>&2
+        exit 1
+        ;;
+    c)  COUNT="$OPTARG" # time to repeat, 0 means indefinetely
+        [ $COUNT -eq 0 ] && COUNT="-1"
+        ;;
+    s)  MINSIGNAL="-${OPTARG#-}" # minimum signal strength, i.e. lower ones will be kicked off. Prefix - may be omitted.
+        ;;
+    i)  WIFIIF="$OPTARG" # wifi interface used as access point
+        ;;
+    v)  VERBOSE="yes" # give more verbose output
+        ;;
+    d)  DEBUG="yes" # more debugging output
+        VERBOSE="yes"
+        ;;
+    q)  QUIET="yes" # very little output
+        ;;
+    x)  DEBUG=yes
+        VERBOSE=yes
+        set -x
+    esac
+done
+
+shift "$((OPTIND-1))"   # Discard the options parsed so far, just leave the rest...
+
+trap "rm -rf "/tmp/$SCRIPTNAME.$$" ; exit" INT QUIT EXIT
+
+if [ -z "$WIFIIF" ]
+then
+  for if in client0 wlan0 
+  do
+    iw $if info 2>&1 > /dev/null && WIFIIF="$if" && echohelper -v "Determined interface $WIFIIF" && break
+  done
+fi
+
+[ "$QUIET" ] || echohelper -q "Filtering for min signal strength $MINSIGNAL ..." 1>&2
+
+[ "$COUNT" -gt 0 ] && [ "$DEBUG" ] && iwinfo "$WIFIIF" assoclist | grep SNR && echohelper -q "Starting..."
+
+IFS=$'\n'
+while [ "$COUNT" -gt 0 -o "$COUNT" -lt 0 ]
+do
+  IFS=$'\n'
+  for LINE in $( iwinfo "$WIFIIF" assoclist | grep SNR ) # awk -- '/SNR/ { print gensub(":", "", "g") }'
+  do
+    unset IFS
+    MAC=$( echo "$LINE" | awk '{ print $1 }' )
+    SIGNAL=$( echo "$LINE" | xargs -n 999 | awk '{ print $2 }' )
+    MAC_PREFIX=$( echo "$MAC" | sed -e 's/://g' -e 's/\(......\).*/\1/' ) # first 6 digits of mac adress
+
+    if [ "$SIGNAL" -lt "$MINSIGNAL" ]
+    then
+      echohelper -v LOW SIGNAL LINE: "$LINE"
+      # set -x
+      if find "$DISCONNECTDIR" -type f | grep -q "$MAC" 
+      then
+        logline "Low signal client $MAC ($SIGNAL) still here, not yet disconnecting again."
+ 
+      # Only allow Apple devices to roam
+      elif [ \! -r "$MACPREFIXFILE" ] || grep -q "$MAC_PREFIX" "$MACPREFIXFILE"
+      then
+        logline "Low signal client $MAC ($SIGNAL) being disconnected."
+        for reason in $( echo $REASONS | xargs -n 1 )
+        do
+          [ "$reason" -eq 19 ] && break
+          echohelper -v "Trying deauthentication with reason id $reason on $MAC (signal had been $SIGNAL)." 
+          ubus call "hostapd.$WIFIIF" del_client "{'addr':'$MAC', 'reason':$reason, 'deauth':false, 'ban_time':0}"
+          sleep 3 
+          iwinfo "$WIFIIF" assoclist | grep SNR | grep "$MAC" || break
+        done
+        if [ "$reason" -eq 19 ] ; then
+          true
+          echohelper -v "Unsuccessful deauthentication with any reason of $REASONS on $MAC (signal strength was $SIGNAL)."
+        else
+          echohelper -v "Probably SUCCESSFUL deauthentication with reason $reason on $MAC (signal was $SIGNAL, $( true date ))."
+          iwinfo "$WIFIIF" assoclist | grep SNR
+        fi
+        # set +x
+        # Add to do-not-disconnect list
+        touch "$DISCONNECTDIR/${MAC}_$( date +%s )"
+      else
+        echohelper -d donothing
+      fi
+    elif [ "$SIGNAL" -lt "-50" ]
+    then
+      echohelper -v "Device $MAC has signal $SIGNAL higher than $MINSIGNAL."
+    fi
+    # set +x
+  done
+
+  # Remove from the do-not-disconnect list
+  CURDATE=$( date +%s )
+  for FILE in $( find "$DISCONNECTDIR" -type f -exec basename '{}' \; )
+  do
+    TIME=$(echo "$FILE" | cut -d'_' -f 2)
+    TIME_SINCE=$(( CURDATE - TIME ))
+    MAC=$(echo "$FILE" | cut -d'_' -f 1)
+
+    if [ "$TIME_SINCE" -gt "$REDISCONNECTTIME" ]; then
+      # protection period expired
+      logline "Low signal client $MAC removed from do-not-disconnect."
+      rm "$DISCONNECTDIR/$FILE"
+    fi
+  done
+
+  COUNT=$(( COUNT - 1 )) 
+  [ $COUNT -ne 0 ] && echohelper -d "$COUNT more run(s). $( date )" && sleep 10 
+done
+
+rm -rf "/tmp/$SCRIPTNAME.$$"
