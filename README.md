@@ -1,4 +1,4 @@
-# angry_wifi_enhanced
+# Disconnect WiFi clients from the AP based on their signal levels
 
 **angry_wifi_with_params** is an enhanced version of the [angry_wifi.sh](<https://gist.githubusercontent.com/lg/e91d1c5c9640d963e13dbb1901bb4396/raw/3782c70c4cb7d2baa7a365fd85bb69293b0c8c07>) shell script.
 It retains the features of the original script plus additional ones as noted below.
